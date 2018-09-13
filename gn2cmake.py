@@ -1,20 +1,21 @@
 #!/usr/bin/env python
 #
 # Copyright 2016 Google Inc.
+# Copyright 2018 Kitware SAS.
+# Modified by Julien Jomier
 #
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
-
 """
-Usage: gn_to_cmake.py <json_file_name>
+Usage: gn2cmake.py <json_file_name>
 
-gn gen out/config --ide=json --json-ide-script=../../gn/gn_to_cmake.py
+gn gen out/config --ide=json --json-ide-script=../../gn/gn2cmake.py
 
 or
 
 gn gen out/config --ide=json
-python gn/gn_to_cmake.py out/config/project.json
+python gn/gn2cmake.py out/config/project.json
 
 The first is recommended, as it will auto-update.
 """
@@ -98,8 +99,10 @@ def SetCurrentTargetProperty(out, property_name, values, sep=''):
   out.write(property_name)
   out.write(' "')
   for value in values:
-    out.write(CMakeStringEscape(value))
-    out.write(sep)
+    # Hack to avoid adding /TP and -TP and the manifest
+    if value != '/TP' and value[0:6] != '/manif' and value[0:20] != 'DEPRECATEDENUMERATOR':
+      out.write(CMakeStringEscape(value))
+      out.write(sep)
   out.write('")\n')
 
 
@@ -141,7 +144,7 @@ cmake_target_types = {
   'executable': CMakeTargetType('add_executable', None, 'RUNTIME', True),
   'loadable_module': CMakeTargetType('add_library', 'MODULE', 'LIBRARY', True),
   'shared_library': CMakeTargetType('add_library', 'SHARED', 'LIBRARY', True),
-  'static_library': CMakeTargetType('add_library', 'STATIC', 'ARCHIVE', False),
+  'static_library': CMakeTargetType('add_library', 'STATIC', 'ARCHIVE', True),
   'source_set': CMakeTargetType('add_library', 'OBJECT', None, False),
   'copy': CMakeTargetType.custom,
   'action': CMakeTargetType.custom,
@@ -229,7 +232,6 @@ class Target(object):
     self.gn_type = self.properties.get('type', None)
     self.cmake_type = cmake_target_types.get(self.gn_type, None)
 
-
 def WriteAction(out, target, project, sources, synthetic_dependencies):
   outputs = []
   output_directories = set()
@@ -271,6 +273,9 @@ def WriteAction(out, target, project, sources, synthetic_dependencies):
 
   out.write('  WORKING_DIRECTORY "')
   out.write(CMakeStringEscape(project.build_path))
+  # JJ change to be the CMAKE_BINARY_DIR
+  # Actually should be the executable dir
+  #out.write('${CMAKE_BINARY_DIR}')
   out.write('"\n')
 
   out.write('  COMMENT "Action: ${target}"\n')
@@ -295,7 +300,7 @@ def WriteActionForEach(out, target, project, sources, synthetic_dependencies):
   all_outputs = target.properties.get('outputs', [])
   inputs = target.properties.get('sources', [])
   # TODO: consider expanding 'output_patterns' instead.
-  outputs_per_input = len(all_outputs) / len(inputs)
+  outputs_per_input = int(len(all_outputs) / len(inputs))
   for count, source in enumerate(inputs):
     source_abs_path = project.GetAbsolutePath(source)
 
@@ -341,9 +346,11 @@ def WriteActionForEach(out, target, project, sources, synthetic_dependencies):
     out.write('"\n')
 
     #TODO: CMake 3.7 is introducing DEPFILE
-
     out.write('  WORKING_DIRECTORY "')
+    # JJ change to be the CMAKE_BINARY_DIR
+    # Actually should be the executable dir
     out.write(CMakeStringEscape(project.build_path))
+    #out.write('${CMAKE_BINARY_DIR}')
     out.write('"\n')
 
     out.write('  COMMENT "Action ${target} on ')
@@ -384,7 +391,10 @@ def WriteCopy(out, target, project, sources, synthetic_dependencies):
   out.write('\n')
 
   out.write('  WORKING_DIRECTORY "')
+  # JJ change to be the CMAKE_BINARY_DIR
+  # Actually should be the executable dir
   out.write(CMakeStringEscape(project.build_path))
+  #out.write('${CMAKE_BINARY_DIR}')
   out.write('"\n')
 
   out.write('  COMMENT "Copy ${target}"\n')
@@ -475,21 +485,18 @@ def WriteSourceVariables(out, target, project):
   source_types = {'cxx':[], 'c':[], 'asm':[],
                   'obj':[], 'obj_target':[], 'input':[], 'other':[]}
 
-  all_sources = target.properties.get('sources', [])
-
-  # As of cmake 3.11 add_library must have sources. If there are
-  # no sources, add empty.cpp as the file to compile.
-  if len(all_sources) == 0:
-    all_sources.append(posixpath.join(project.build_path, 'empty.cpp'))
-
   # TODO .def files on Windows
-  for source in all_sources:
+  for source in target.properties.get('sources', []):
     _, ext = posixpath.splitext(source)
     source_abs_path = project.GetAbsolutePath(source)
     source_types[source_file_types.get(ext, 'other')].append(source_abs_path)
 
   for input_path in target.properties.get('inputs', []):
     input_abs_path = project.GetAbsolutePath(input_path)
+    # JJ: Added to specify a clean target for .exe
+    if input_path[-4:] == '.exe':
+      input_abs_path = input_path[input_path.rfind('/')+1:];
+
     source_types['input'].append(input_abs_path)
 
   # OBJECT library dependencies need to be listed as sources.
@@ -512,6 +519,7 @@ def WriteSourceVariables(out, target, project):
 
 
 def WriteTarget(out, target, project):
+  
   out.write('\n#')
   out.write(target.gn_name)
   out.write('\n')
@@ -525,6 +533,14 @@ def WriteTarget(out, target, project):
 
   sources = WriteSourceVariables(out, target, project)
 
+  # JJ: If the target is a source_set and not files are present
+  # we just return
+  if target.gn_type == 'source_set':
+    if not sources:
+      #print('The target ',target.gn_name,' does not have any object files')
+      out.write('add_library(${target} OBJECT dummy.cxx)\n')
+      return
+	 
   synthetic_dependencies = set()
   if target.gn_type == 'action':
     WriteAction(out, target, project, sources, synthetic_dependencies)
@@ -533,6 +549,14 @@ def WriteTarget(out, target, project):
   if target.gn_type == 'copy':
     WriteCopy(out, target, project, sources, synthetic_dependencies)
 
+  # JJ: Check the custom target if the input paths is .exe then we cannot add
+  # it as SOURCES
+  if target.cmake_type.command == 'add_custom_target':   
+    for input_path in target.properties.get('inputs', []):
+      input_abs_path = project.GetAbsolutePath(input_path)
+      if input_abs_path[-4:] == '.exe':
+        sources = {}
+	
   out.write(target.cmake_type.command)
   out.write('("${target}"')
   if target.cmake_type.modifier is not None:
@@ -545,6 +569,30 @@ def WriteTarget(out, target, project):
     for synthetic_dependencie in synthetic_dependencies:
       WriteVariable(out, synthetic_dependencie, ' ')
   out.write(')\n')
+
+  # JJ If the output of the target is an executable we rename the target
+  if target.cmake_type.command == 'add_executable':
+    if target.properties.get('outputs',[])[0]:
+      output_abs_path = project.GetAbsolutePath(target.properties.get('outputs',[])[0])
+      filename = posixpath.basename(output_abs_path)
+      executablename,extension = os.path.splitext(filename)
+      out.write('set_target_properties("${target}" PROPERTIES OUTPUT_NAME ')
+      out.write(executablename)
+      out.write(')\n')
+      # Also write an alias target
+      out.write('add_executable(')
+      out.write(executablename)
+      out.write(' ALIAS "${target}"')
+      out.write(')\n')
+      # We also do a custom command to copy the output
+      out.write('add_custom_command(\n')
+      out.write('  TARGET "${target}"\n')
+      out.write('  COMMAND ${CMAKE_COMMAND} -E copy ')
+      out.write('  $<TARGET_FILE:${target}> ')
+      out.write(project.build_path)
+      out.write('$<TARGET_FILE_NAME:${target}>\n')
+      out.write('  DEPENDS "${target}"\n')
+      out.write(')\n')
 
   if target.cmake_type.command != 'add_custom_target':
     WriteCompilerFlags(out, target, project, sources)
@@ -566,6 +614,7 @@ def WriteTarget(out, target, project):
     gn_dependency_type = project.targets.get(dependency, {}).get('type', None)
     cmake_dependency_type = cmake_target_types.get(gn_dependency_type, None)
     cmake_dependency_name = project.GetCMakeTargetName(dependency)
+
     if cmake_dependency_type.command != 'add_library':
       nonlibraries.add(cmake_dependency_name)
     elif cmake_dependency_type.modifier != 'OBJECT':
@@ -577,6 +626,7 @@ def WriteTarget(out, target, project):
   # Non-library dependencies.
   if nonlibraries:
     out.write('add_dependencies("${target}"')
+
     for nonlibrary in nonlibraries:
       out.write('\n  "')
       out.write(nonlibrary)
@@ -623,45 +673,37 @@ def WriteTarget(out, target, project):
 
 
 def WriteProject(project):
-  out = open(posixpath.join(project.build_path, 'CMakeLists.txt'), 'w+')
-  extName = posixpath.join(project.build_path, 'CMakeLists.ext')
-  out.write('# Generated by gn_to_cmake.py.\n')
-  out.write('cmake_minimum_required(VERSION 2.8.8 FATAL_ERROR)\n')
-  out.write('cmake_policy(VERSION 2.8.8)\n\n')
-
-  out.write('file(WRITE "')
-  out.write(CMakeStringEscape(posixpath.join(project.build_path, "empty.cpp")))
-  out.write('")\n')
-
+  #out = open(posixpath.join(project.build_path, 'CMakeLists.txt'), 'w+')
+  #out.write('# Generated by gn2cmake.py.\n')
+  #out.write('cmake_minimum_required(VERSION 3.1 FATAL_ERROR)\n')
+  
   # Update the gn generated ninja build.
   # If a build file has changed, this will update CMakeLists.ext if
   # gn gen out/config --ide=json --json-ide-script=../../gn/gn_to_cmake.py
   # style was used to create this config.
-  out.write('execute_process(COMMAND\n')
-  out.write('  ninja -C "')
-  out.write(CMakeStringEscape(project.build_path))
-  out.write('" build.ninja\n')
-  out.write('  RESULT_VARIABLE ninja_result)\n')
-  out.write('if (ninja_result)\n')
-  out.write('  message(WARNING ')
-  out.write('"Regeneration failed running ninja: ${ninja_result}")\n')
-  out.write('endif()\n')
+  #out.write('execute_process(COMMAND ninja -C "')
+  #out.write(CMakeStringEscape(project.build_path))
+  #out.write('" build.ninja)\n')
 
-  out.write('include("')
-  out.write(CMakeStringEscape(extName))
-  out.write('")\n')
-  out.close()
+  #out.write('include(CMakeLists.ext)\n')
+  #out.close()
 
-  out = open(extName, 'w+')
-  out.write('# Generated by gn_to_cmake.py.\n')
-  out.write('cmake_minimum_required(VERSION 2.8.8 FATAL_ERROR)\n')
-  out.write('cmake_policy(VERSION 2.8.8)\n')
-
+  out = open(posixpath.join(project.build_path, 'CMakeLists.txt'), 'w+')
+  out.write('# Generated by gn2cmake.py.\n')
+  out.write('cmake_minimum_required(VERSION 3.1 FATAL_ERROR)\n')
+  
   # The following appears to be as-yet undocumented.
   # http://public.kitware.com/Bug/view.php?id=8392
   out.write('enable_language(ASM)\n\n')
   # ASM-ATT does not support .S files.
   # output.write('enable_language(ASM-ATT)\n')
+
+  # JJ : Added since this is required for Visual Studio 2017
+  out.write('# JJ:  This is necessary otherwise some of the data are not found\n')
+  out.write('list(APPEND CMAKE_PREFIX_PATH "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.16299.0/um/x64")\n')
+  out.write('list(APPEND CMAKE_PREFIX_PATH "C:/Program Files (x86)/Microsoft Visual Studio/2017/Community/VC/Tools/MSVC/14.13.26128/lib/x64")\n')
+  out.write('set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /NODEFAULTLIB:libcmtd.lib /NODEFAULTLIB:libcmt.lib")\n\n')
+ 
 
   # Current issues with automatic re-generation:
   # The gn generated build.ninja target uses build.ninja.d
@@ -679,17 +721,8 @@ def WriteProject(project):
   # but gn doesn't escape spaces here (it generates invalid .d files).
   out.write('string(REPLACE " " ";" "gn_deps" ${gn_deps_string})\n')
   out.write('foreach("gn_dep" ${gn_deps})\n')
-  out.write('  configure_file("')
-  out.write(CMakeStringEscape(project.build_path))
-  out.write('${gn_dep}" "CMakeLists.devnull" COPYONLY)\n')
+  out.write('  configure_file(${gn_dep} "CMakeLists.devnull" COPYONLY)\n')
   out.write('endforeach("gn_dep")\n')
-
-  out.write('list(APPEND other_deps "')
-  out.write(CMakeStringEscape(os.path.abspath(__file__)))
-  out.write('")\n')
-  out.write('foreach("other_dep" ${other_deps})\n')
-  out.write('  configure_file("${other_dep}" "CMakeLists.devnull" COPYONLY)\n')
-  out.write('endforeach("other_dep")\n')
 
   for target_name in project.targets.keys():
     out.write('\n')
